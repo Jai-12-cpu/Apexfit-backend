@@ -9,14 +9,14 @@ app = FastAPI()
 # IMPORTANT: This allows your Vercel frontend to talk to this Railway backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # For production, you can replace "*" with your Vercel URL
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://apexfit-frontend.vercel.app/"], # For production, you can replace "*" with your Vercel URL
+    allow_methods=["https://apexfit-frontend.vercel.app/"],
+    allow_headers=["https://apexfit-frontend.vercel.app/"],
 )
 
 # Connect to the Postgres database using the link in your Railway variables
 def get_db_connection():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    conn = psycopg2.connect(os.getenv("postgresql://postgres:BAxLFvDOMgRorMRSAIpgwrMUqhpsBLJB@postgres.railway.internal:5432/railway"))
     return conn
 
 @app.post("/save-workout")
