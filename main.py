@@ -9,7 +9,7 @@ app = FastAPI()
 # IMPORTANT: This allows your Vercel frontend to talk to this Railway backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://apexfit-frontend.vercel.app/"], # For production, you can replace "*" with your Vercel URL
+    allow_origins=["https://apexfit-frontend.vercel.app"], # For production, you can replace "*" with your Vercel URL
     allow_methods=["*"],
     allow_headers=["*"],
 )
