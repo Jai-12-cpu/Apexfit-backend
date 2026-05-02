@@ -16,7 +16,7 @@ app.add_middleware(
 
 # Connect to the Postgres database using the link in your Railway variables
 def get_db_connection():
-    conn = psycopg2.connect(os.getenv("postgresql://postgres:BAxLFvDOMgRorMRSAIpgwrMUqhpsBLJB@postgres.railway.internal:5432/railway"))
+    conn = psycopg2.connect(os.getenv("DATABASE_URL")) 
     return conn
 
 @app.post("/save-workout")
