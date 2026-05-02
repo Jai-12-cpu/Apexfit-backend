@@ -10,8 +10,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://apexfit-frontend.vercel.app/"], # For production, you can replace "*" with your Vercel URL
-    allow_methods=["https://apexfit-frontend.vercel.app/"],
-    allow_headers=["https://apexfit-frontend.vercel.app/"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Connect to the Postgres database using the link in your Railway variables
