@@ -49,15 +49,20 @@ async def save_workout(request: Request):
 def read_root():
     return {"message": "ApexFit API is Online"}
 
-@app.get("/get-workouts")
-def get_workouts():
+@app.get("/workout-stats")
+def get_workout_stats():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Fetch all data sorted by date so the chart flows correctly
-    cur.execute("SELECT data FROM workouts ORDER BY workout_date ASC")
+    # Pull weekly volume, grouped by week
+    cur.execute("""
+        SELECT
+            date_trunc('week', workout_date::date) AS week,
+            SUM((data->>'totalVolume')::numeric) AS total_volume
+        FROM workouts
+        GROUP BY week
+        ORDER BY week
+    """)
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    
-    # Each row[0] is the JSONB data we saved earlier
-    return [row[0] for row in rows]
+    return [{"week": str(r[0]), "volume": r[1]} for r in rows]
