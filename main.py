@@ -48,3 +48,16 @@ async def save_workout(request: Request):
 @app.get("/")
 def read_root():
     return {"message": "ApexFit API is Online"}
+
+@app.get("/get-workouts")
+def get_workouts():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Fetch all data sorted by date so the chart flows correctly
+    cur.execute("SELECT data FROM workouts ORDER BY workout_date ASC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    # Each row[0] is the JSONB data we saved earlier
+    return [row[0] for row in rows]
