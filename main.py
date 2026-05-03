@@ -488,32 +488,72 @@ def discard_workout(session_id: str, uid: str = Depends(get_current_user)):
 # ── WORKOUTS (legacy save — kept for backwards compatibility) ─────────────────
 
 @app.post("/save-workout")
-async def save_workout(request: Request, uid: str = Depends(get_current_user)):
+async def save_workout(
+    request: Request, 
+    uid: str = Depends(get_current_user),
+    conn = Depends(get_db)  # 1. Inject the DB connection safely
+):
     """
     Legacy endpoint. Prefer POST /workout/start → PATCH → POST /workout/{id}/end.
     Stats are recomputed here too so even legacy saves feed the charts correctly.
     """
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
     exercises = data.get("exercises", [])
     started_at = data.get("sessionDate", data.get("startedAt", ""))
     ended_at   = data.get("endedAt", started_at)
+    
+    # Recompute stats
     stats = compute_workout_stats(exercises, started_at, ended_at)
-    # Merge computed stats into the payload (overwrite any client-sent values)
+    
+    # Merge computed stats
     data.update({
-        "totalVolume":     stats["totalVolume"],
-        "totalSets":       stats["totalSets"],
-        "totalReps":       stats["totalReps"],
-        "durationMinutes": stats["durationMinutes"],
-        "muscleVolumes":   stats["muscleVolumes"],
+        "totalVolume":     stats.get("totalVolume", 0),
+        "totalSets":       stats.get("totalSets", 0),
+        "totalReps":       stats.get("totalReps", 0),
+        "durationMinutes": stats.get("durationMinutes", 0),
+        "muscleVolumes":   stats.get("muscleVolumes", {}),
         "exercises":       exercises,
     })
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO workouts (user_id, workout_date, data) VALUES (%s,%s,%s) RETURNING id",
-                (uid, data.get("sessionDate"), json.dumps(data)))
-    wid = cur.fetchone()[0]
-    conn.commit(); cur.close(); conn.close()
-    return {"status": "success", "workoutId": wid}
+
+    # 2. Safely parse the date. PostgreSQL hates raw JS ISO strings.
+    session_date_str = data.get("sessionDate")
+    if session_date_str:
+        try:
+            # Convert "2026-05-03T03:51:09.000Z" to a Python datetime object
+            parsed_date = datetime.fromisoformat(session_date_str.replace('Z', '+00:00'))
+        except ValueError:
+            parsed_date = datetime.utcnow()
+    else:
+        parsed_date = datetime.utcnow()
+
+    cur = None
+    try:
+        # 3. Execute with proper Try/Except to catch SQL formatting errors
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO workouts (user_id, workout_date, data) VALUES (%s, %s, %s) RETURNING id",
+            (uid, parsed_date, json.dumps(data))
+        )
+        wid = cur.fetchone()[0]
+        
+        # 4. Commit the transaction so it actually saves
+        conn.commit()
+        return {"status": "success", "workoutId": wid}
+        
+    except Exception as e:
+        # 5. Rollback on failure so the database doesn't lock up
+        conn.rollback()
+        print(f"CRITICAL DB ERROR: {e}") # Look for this line in Railway!
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # Always close the cursor. Let get_db handle closing the connection.
+        if cur:
+            cur.close()
 
 @app.get("/today/latest-session")
 def get_latest(uid: str = Depends(get_current_user)):
