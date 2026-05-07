@@ -10,7 +10,8 @@ import hmac
 import base64
 import time
 import uuid
-from typing import Optional
+from typing import Optional, Generator
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -26,11 +27,20 @@ security = HTTPBearer(auto_error=False)
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 
-def get_db():
+def _new_conn():
+    """Raw connection — only used internally (init_db, endpoints managing their own conn)."""
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
+def get_db():
+    """FastAPI dependency — yields a connection and guarantees it is closed after the request."""
+    conn = _new_conn()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 def init_db():
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -172,7 +182,6 @@ def compute_workout_stats(exercises: list, started_at_iso: str, ended_at_iso: st
         ex["totalVolume"] = ex_volume
 
     # duration from real timestamps
-    from datetime import datetime, timezone
     fmt = "%Y-%m-%dT%H:%M:%S.%f%z"
     def _parse(ts):
         # handle both with and without microseconds, with and without Z
@@ -217,7 +226,7 @@ async def register(request: Request):
         raise HTTPException(400, "Name, email, and password required")
     if len(password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT id FROM users WHERE email=%s", (email,))
     if cur.fetchone():
@@ -237,7 +246,7 @@ async def login(request: Request):
     data = await request.json()
     email = (data.get("email") or "").strip().lower()
     password = data.get("password", "")
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM users WHERE email=%s", (email,))
     user = cur.fetchone(); cur.close(); conn.close()
@@ -255,7 +264,7 @@ async def google_auth(request: Request):
     name = data.get("name", "")
     if not google_id or not email:
         raise HTTPException(400, "Invalid Google data")
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM users WHERE email=%s OR google_id=%s", (email, google_id))
     user = cur.fetchone()
@@ -279,7 +288,7 @@ async def google_auth(request: Request):
 
 @app.get("/auth/me")
 def get_me(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT id, name, email, avatar_initials FROM users WHERE id=%s", (uid,))
     user = cur.fetchone(); cur.close(); conn.close()
@@ -291,7 +300,7 @@ def get_me(uid: str = Depends(get_current_user)):
 
 @app.get("/goals")
 def get_goals(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT goals FROM user_goals WHERE user_id=%s", (uid,))
     row = cur.fetchone(); cur.close(); conn.close()
@@ -300,7 +309,7 @@ def get_goals(uid: str = Depends(get_current_user)):
 @app.post("/goals")
 async def save_goals(request: Request, uid: str = Depends(get_current_user)):
     goals = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO user_goals (user_id, goals) VALUES (%s,%s)
@@ -327,14 +336,13 @@ async def start_workout(request: Request, uid: str = Depends(get_current_user)):
       { "sessionId": "<uuid>", "startedAt": "<ISO timestamp>", "data": { ... } }
     """
     body = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     # Only one active session per user at a time — discard any stale ones
     cur.execute("DELETE FROM active_sessions WHERE user_id=%s", (uid,))
 
     session_id = str(uuid.uuid4())
-    from datetime import datetime, timezone
     started_at = datetime.now(timezone.utc).isoformat()
 
     session_data = {
@@ -359,7 +367,7 @@ def get_active_workout(uid: str = Depends(get_current_user)):
     """
     Returns the user's current in-progress session, or 404 if none.
     """
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM active_sessions WHERE user_id=%s", (uid,))
     row = cur.fetchone(); cur.close(); conn.close()
@@ -381,7 +389,7 @@ async def update_active_workout(session_id: str, request: Request, uid: str = De
       }
     """
     body = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT data FROM active_sessions WHERE id=%s AND user_id=%s", (session_id, uid))
     row = cur.fetchone()
@@ -420,7 +428,7 @@ async def end_workout(session_id: str, request: Request, uid: str = Depends(get_
     Every chart-feeding field is derived — nothing is hardcoded.
     """
     body = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("SELECT * FROM active_sessions WHERE id=%s AND user_id=%s", (session_id, uid))
@@ -440,7 +448,6 @@ async def end_workout(session_id: str, request: Request, uid: str = Depends(get_
     if "sessionType" in body:
         session_data["sessionType"] = body["sessionType"]
 
-    from datetime import datetime, timezone
     ended_at = datetime.now(timezone.utc).isoformat()
 
     exercises = session_data.get("exercises", [])
@@ -478,7 +485,7 @@ def discard_workout(session_id: str, uid: str = Depends(get_current_user)):
     """
     Cancel a workout without saving it.
     """
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM active_sessions WHERE id=%s AND user_id=%s", (session_id, uid))
     conn.commit(); cur.close(); conn.close()
@@ -489,12 +496,11 @@ def discard_workout(session_id: str, uid: str = Depends(get_current_user)):
 
 @app.post("/save-workout")
 async def save_workout(
-    request: Request, 
+    request: Request,
     uid: str = Depends(get_current_user),
-    conn = Depends(get_db)  # 1. Inject the DB connection safely
 ):
     """
-    Legacy endpoint. Prefer POST /workout/start → PATCH → POST /workout/{id}/end.
+    Legacy endpoint. Prefer POST /workout/start -> PATCH -> POST /workout/{id}/end.
     Stats are recomputed here too so even legacy saves feed the charts correctly.
     """
     try:
@@ -505,11 +511,11 @@ async def save_workout(
     exercises = data.get("exercises", [])
     started_at = data.get("sessionDate", data.get("startedAt", ""))
     ended_at   = data.get("endedAt", started_at)
-    
-    # Recompute stats
+
+    # Recompute stats from real exercise data
     stats = compute_workout_stats(exercises, started_at, ended_at)
-    
-    # Merge computed stats
+
+    # Merge computed stats into the record
     data.update({
         "totalVolume":     stats.get("totalVolume", 0),
         "totalSets":       stats.get("totalSets", 0),
@@ -519,45 +525,41 @@ async def save_workout(
         "exercises":       exercises,
     })
 
-    # 2. Safely parse the date. PostgreSQL hates raw JS ISO strings.
+    # Safely parse the date -- PostgreSQL needs a proper timestamptz, not a raw JS string
     session_date_str = data.get("sessionDate")
     if session_date_str:
         try:
-            # Convert "2026-05-03T03:51:09.000Z" to a Python datetime object
-            parsed_date = datetime.fromisoformat(session_date_str.replace('Z', '+00:00'))
+            parsed_date = datetime.fromisoformat(session_date_str.replace("Z", "+00:00"))
         except ValueError:
-            parsed_date = datetime.utcnow()
+            parsed_date = datetime.now(timezone.utc)
     else:
-        parsed_date = datetime.utcnow()
+        parsed_date = datetime.now(timezone.utc)
 
+    conn = _new_conn()
     cur = None
     try:
-        # 3. Execute with proper Try/Except to catch SQL formatting errors
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO workouts (user_id, workout_date, data) VALUES (%s, %s, %s) RETURNING id",
             (uid, parsed_date, json.dumps(data))
         )
         wid = cur.fetchone()[0]
-        
-        # 4. Commit the transaction so it actually saves
         conn.commit()
         return {"status": "success", "workoutId": wid}
-        
+
     except Exception as e:
-        # 5. Rollback on failure so the database doesn't lock up
         conn.rollback()
-        print(f"CRITICAL DB ERROR: {e}") # Look for this line in Railway!
+        print(f"CRITICAL DB ERROR in /save-workout: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-        
+
     finally:
-        # Always close the cursor. Let get_db handle closing the connection.
         if cur:
             cur.close()
+        conn.close()
 
 @app.get("/today/latest-session")
 def get_latest(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT data FROM workouts WHERE user_id=%s ORDER BY (data->>'sessionDate')::timestamptz DESC LIMIT 1", (uid,))
     row = cur.fetchone(); cur.close(); conn.close()
@@ -567,7 +569,7 @@ def get_latest(uid: str = Depends(get_current_user)):
 
 @app.get("/stats/summary")
 def get_summary(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT COUNT(*) AS total_sessions,
@@ -586,7 +588,7 @@ def get_summary(uid: str = Depends(get_current_user)):
 
 @app.get("/stats/weekly-volume")
 def get_weekly_volume(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT TO_CHAR(DATE_TRUNC('week',(data->>'sessionDate')::timestamptz),'Mon DD') AS week,
@@ -605,7 +607,7 @@ def get_muscle_split(uid: str = Depends(get_current_user)):
     Uses the computed muscleVolumes JSONB field written by compute_workout_stats,
     so results always match actual completed sets.
     """
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT key AS muscle, SUM(value::numeric) AS volume
@@ -631,7 +633,7 @@ def get_muscle_split(uid: str = Depends(get_current_user)):
 
 @app.get("/stats/lift-history")
 def get_lift_history(exercise: str, uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT TO_CHAR((data->>'sessionDate')::timestamptz,'Mon DD') AS session_date,
@@ -650,7 +652,7 @@ def get_lift_history(exercise: str, uid: str = Depends(get_current_user)):
 
 @app.get("/stats/duration-by-day")
 def get_duration_by_day(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT TO_CHAR((data->>'sessionDate')::timestamptz,'Dy') AS day_name,
@@ -664,7 +666,7 @@ def get_duration_by_day(uid: str = Depends(get_current_user)):
 
 @app.get("/stats/consistency")
 def get_consistency(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT TO_CHAR(DATE_TRUNC('month',(data->>'sessionDate')::timestamptz),'Mon YY') AS month,
@@ -679,7 +681,7 @@ def get_consistency(uid: str = Depends(get_current_user)):
 
 @app.get("/stats/personal-records")
 def get_prs(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT ex->>'name' AS exercise, ex->>'muscle' AS muscle,
@@ -699,7 +701,7 @@ def get_prs(uid: str = Depends(get_current_user)):
 
 @app.get("/history/sessions")
 def get_sessions(limit: int = 20, uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT w.id, data->>'sessionName' AS session_name, data->>'sessionType' AS session_type,
@@ -715,7 +717,7 @@ def get_sessions(limit: int = 20, uid: str = Depends(get_current_user)):
 
 @app.get("/history/volume-by-type")
 def get_volume_by_type(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT TO_CHAR(DATE_TRUNC('week',(data->>'sessionDate')::timestamptz),'Mon DD') AS week,
@@ -740,7 +742,7 @@ def get_volume_by_type(uid: str = Depends(get_current_user)):
 @app.post("/journal")
 async def save_journal(request: Request, uid: str = Depends(get_current_user)):
     data = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor()
     cur.execute("INSERT INTO journal_entries (user_id, workout_id, note, mood, energy_level) VALUES (%s,%s,%s,%s,%s)",
                 (uid, data.get("workoutId"), data.get("note"), data.get("mood"), data.get("energyLevel")))
@@ -749,7 +751,7 @@ async def save_journal(request: Request, uid: str = Depends(get_current_user)):
 
 @app.get("/journal")
 def get_journal(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT j.*, w.data->>'sessionName' AS session_name, w.data->>'sessionDate' AS session_date
@@ -764,7 +766,7 @@ def get_journal(uid: str = Depends(get_current_user)):
 @app.post("/photos")
 async def save_photo(request: Request, uid: str = Depends(get_current_user)):
     data = await request.json()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("INSERT INTO progress_photos (user_id, photo_url, note, body_weight) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
                 (uid, data.get("photoUrl"), data.get("note"), data.get("bodyWeight")))
@@ -773,7 +775,7 @@ async def save_photo(request: Request, uid: str = Depends(get_current_user)):
 
 @app.get("/photos")
 def get_photos(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM progress_photos WHERE user_id=%s ORDER BY created_at DESC LIMIT 20", (uid,))
     rows = cur.fetchall(); cur.close(); conn.close()
@@ -783,7 +785,7 @@ def get_photos(uid: str = Depends(get_current_user)):
 
 @app.get("/leaderboard")
 def get_leaderboard(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
         SELECT u.id, u.name, u.avatar_initials,
@@ -805,7 +807,7 @@ def get_leaderboard(uid: str = Depends(get_current_user)):
 async def add_friend(request: Request, uid: str = Depends(get_current_user)):
     data = await request.json()
     email = (data.get("email") or "").strip().lower()
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT id, name FROM users WHERE email=%s", (email,))
     friend = cur.fetchone()
@@ -822,7 +824,7 @@ async def add_friend(request: Request, uid: str = Depends(get_current_user)):
 
 @app.get("/ai/context")
 def get_ai_context(uid: str = Depends(get_current_user)):
-    conn = get_db()
+    conn = _new_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT goals FROM user_goals WHERE user_id=%s", (uid,))
     goals_row = cur.fetchone()
@@ -843,3 +845,36 @@ def get_ai_context(uid: str = Depends(get_current_user)):
     return {"goals": goals_row["goals"] if goals_row else None,
             "recentSessions": [dict(r) for r in recent],
             "personalRecords": [dict(r) for r in prs]}
+
+# ── AI PROXY (keeps Anthropic API key server-side) ────────────────────────────
+
+@app.post("/ai/chat")
+async def ai_chat(request: Request, uid: str = Depends(get_current_user)):
+    """
+    Proxy for Anthropic API calls. Keeps the API key out of the browser.
+    Request body: { "prompt": "...", "max_tokens": 500 }
+    """
+    import httpx
+    data = await request.json()
+    prompt = data.get("prompt", "")
+    max_tokens = int(data.get("max_tokens", 500))
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        raise HTTPException(500, "AI not configured — set ANTHROPIC_API_KEY env var")
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {
+        "x-api-key": anthropic_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
+    if not r.is_success:
+        raise HTTPException(502, f"AI request failed: {r.status_code}")
+    return r.json()
